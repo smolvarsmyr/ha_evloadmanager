@@ -1,0 +1,2204 @@
+# ============================================================
+# EV LOAD MANAGER
+#
+# Feedback-based EV charging control for Home Assistant.
+#
+# THIS PACKAGE ONLY WRITES TO:
+#
+#   - the Zaptec installation "Available current"
+#     (main fuse + hourly energy control)
+#   - each charger's "Charger max current"
+#     (price scheduling / Charge now)
+#
+# It deliberately does NOT assume any mapping between Zaptec
+# charger phases and the main-supply meter phases.
+#
+# Constraints:
+#   1. Main fuse protection
+#   2. Maximum household kWh per clock hour
+#   3. Price-controlled charging
+#
+# Reductions happen immediately.
+# Increases happen slowly, one step at a time.
+# ============================================================
+
+
+# ============================================================
+# CONFIGURATION  -  EDIT THIS SECTION
+#
+# Replace the entity IDs below with your own. You find them in
+# Settings -> Devices & services -> Entities.
+#
+# Each entity ID is written exactly ONCE, here. The "&name"
+# part is a YAML anchor that is reused further down as "*name".
+# Only change the text AFTER the anchor.
+#
+# Nothing below this section should need editing.
+# ============================================================
+
+template:
+
+  - sensor:
+
+      - name: "EVLM config"
+        unique_id: evlm_config
+        icon: mdi:cog
+        state: "ok"
+        attributes:
+
+          # --- Main supply meter (e.g. Tibber Pulse) ---------
+
+          # Current per phase on the main supply (A)
+          meter_current_l1: &meter_current_l1 sensor.tibber_pulse_your_home_current_l1
+          meter_current_l2: &meter_current_l2 sensor.tibber_pulse_your_home_current_l2
+          meter_current_l3: &meter_current_l3 sensor.tibber_pulse_your_home_current_l3
+
+          # Whole-house power right now (W)
+          meter_power: &meter_power sensor.tibber_pulse_your_home_power
+
+          # Cumulative energy, ever-increasing (kWh)
+          meter_energy: &meter_energy sensor.tibber_pulse_your_home_accumulated_consumption
+
+          # --- Zaptec ----------------------------------------
+
+          # Installation "Available current" (shared limit)
+          installation_current: &installation_current number.your_installation_available_current
+
+          # Per-charger "Charger max current"
+          garage_max_current: &garage_max_current number.your_garage_charger_charger_max_current
+          outside_max_current: &outside_max_current number.your_outside_charger_charger_max_current
+
+          # --- Price schedule --------------------------------
+          #
+          # Total price per kWh (energy + grid tariff) in the
+          # cheap and expensive periods. Display only; charging
+          # decisions use the hours below.
+
+          price_cheap: 0.7669
+          price_expensive: 0.9952
+
+          # Cheap period: from this hour, until this hour the
+          # next morning (must cross midnight).
+          cheap_from_hour: 22
+          cheap_until_hour: 6
+
+          # Whole weekend counts as cheap
+          cheap_weekends: true
+
+
+      # ------------------------------------------------------
+      # Reports any configured entity that is missing or has
+      # no value. Should say "OK".
+      # ------------------------------------------------------
+
+      - name: "EVLM configuration check"
+        unique_id: evlm_configuration_check
+        icon: mdi:clipboard-check-outline
+        state: >
+          {% set ns = namespace(bad=[]) %}
+
+          {% for key in [
+            'meter_current_l1',
+            'meter_current_l2',
+            'meter_current_l3',
+            'meter_power',
+            'meter_energy',
+            'installation_current',
+            'garage_max_current',
+            'outside_max_current'
+          ] %}
+
+            {% set e =
+              state_attr('sensor.evlm_config', key) | string
+            %}
+
+            {% if not has_value(e) %}
+              {% set ns.bad = ns.bad + [e] %}
+            {% endif %}
+
+          {% endfor %}
+
+          {% if ns.bad | count == 0 %}
+            OK
+          {% else %}
+            {{ ('No value: ' ~ ns.bad | join(', ')) | truncate(250) }}
+          {% endif %}
+
+
+  # ==========================================================
+  # INPUT SENSORS
+  #
+  # Mirrors of the configured source entities. All logic
+  # below reads these instead of the sources directly.
+  # ==========================================================
+
+  - sensor:
+
+      - name: "EVLM phase L1 current"
+        unique_id: evlm_phase_l1_current
+        unit_of_measurement: A
+        device_class: current
+        state_class: measurement
+        availability: >
+          {{
+            is_number(states(
+              state_attr('sensor.evlm_config', 'meter_current_l1')
+              | string
+            ))
+          }}
+        state: >
+          {{
+            states(
+              state_attr('sensor.evlm_config', 'meter_current_l1')
+              | string
+            )
+            | float(0)
+          }}
+
+
+      - name: "EVLM phase L2 current"
+        unique_id: evlm_phase_l2_current
+        unit_of_measurement: A
+        device_class: current
+        state_class: measurement
+        availability: >
+          {{
+            is_number(states(
+              state_attr('sensor.evlm_config', 'meter_current_l2')
+              | string
+            ))
+          }}
+        state: >
+          {{
+            states(
+              state_attr('sensor.evlm_config', 'meter_current_l2')
+              | string
+            )
+            | float(0)
+          }}
+
+
+      - name: "EVLM phase L3 current"
+        unique_id: evlm_phase_l3_current
+        unit_of_measurement: A
+        device_class: current
+        state_class: measurement
+        availability: >
+          {{
+            is_number(states(
+              state_attr('sensor.evlm_config', 'meter_current_l3')
+              | string
+            ))
+          }}
+        state: >
+          {{
+            states(
+              state_attr('sensor.evlm_config', 'meter_current_l3')
+              | string
+            )
+            | float(0)
+          }}
+
+
+      - name: "EVLM house power"
+        unique_id: evlm_house_power
+        unit_of_measurement: kW
+        state_class: measurement
+        device_class: power
+        icon: mdi:home-lightning-bolt
+        availability: >
+          {{
+            is_number(states(
+              state_attr('sensor.evlm_config', 'meter_power')
+              | string
+            ))
+          }}
+        state: >
+          {{
+            (
+              states(
+                state_attr('sensor.evlm_config', 'meter_power')
+                | string
+              )
+              | float(0)
+              / 1000
+            )
+            | round(3)
+          }}
+
+
+      - name: "EVLM installation current"
+        unique_id: evlm_installation_current
+        unit_of_measurement: A
+        state_class: measurement
+        icon: mdi:ev-station
+        availability: >
+          {{
+            is_number(states(
+              state_attr('sensor.evlm_config', 'installation_current')
+              | string
+            ))
+          }}
+        state: >
+          {{
+            states(
+              state_attr('sensor.evlm_config', 'installation_current')
+              | string
+            )
+            | float(0)
+          }}
+
+
+  # ==========================================================
+  # SENSOR AVAILABILITY
+  # ==========================================================
+
+  - binary_sensor:
+
+      - name: "EVLM fuse measurements available"
+        unique_id: evlm_fuse_measurements_available
+        state: >
+          {{
+            is_number(states('sensor.evlm_phase_l1_current'))
+            and
+            is_number(states('sensor.evlm_phase_l2_current'))
+            and
+            is_number(states('sensor.evlm_phase_l3_current'))
+          }}
+        icon: >
+          {% if this.state == 'on' %}
+            mdi:check-circle
+          {% else %}
+            mdi:alert-circle
+          {% endif %}
+
+
+      - name: "EVLM hourly measurements available"
+        unique_id: evlm_hourly_measurements_available
+        state: >
+          {{
+            is_number(states('sensor.evlm_house_energy_current_hour'))
+            and
+            is_number(states('sensor.evlm_house_power'))
+          }}
+        icon: >
+          {% if this.state == 'on' %}
+            mdi:check-circle
+          {% else %}
+            mdi:alert-circle
+          {% endif %}
+
+      # ------------------------------------------------------
+      # PER-CHARGER PRICE PERMISSION
+      #
+      # A charger is allowed when:
+      # - price control is disabled, OR
+      # - it is currently a cheap period, OR
+      # - its own 12-hour Charge now timer is active.
+      # ------------------------------------------------------
+
+      - name: "EVLM garage charging allowed by price"
+        unique_id: evlm_garage_charging_allowed_by_price
+        state: >
+          {{
+            is_state('input_boolean.evlm_price_control', 'off')
+            or
+            is_state('binary_sensor.evlm_price_allowed', 'on')
+            or
+            is_state('timer.evlm_garage_charge_now', 'active')
+          }}
+        icon: >
+          {% if this.state == 'on' %}
+            mdi:ev-station
+          {% else %}
+            mdi:ev-station-off
+          {% endif %}
+
+
+      - name: "EVLM outside charging allowed by price"
+        unique_id: evlm_outside_charging_allowed_by_price
+        state: >
+          {{
+            is_state('input_boolean.evlm_price_control', 'off')
+            or
+            is_state('binary_sensor.evlm_price_allowed', 'on')
+            or
+            is_state('timer.evlm_outside_charge_now', 'active')
+          }}
+        icon: >
+          {% if this.state == 'on' %}
+            mdi:ev-station
+          {% else %}
+            mdi:ev-station-off
+          {% endif %}
+
+
+      # ------------------------------------------------------
+      # PRICE ALLOWED
+      #
+      # On when we are inside the configured cheap period
+      # (see CONFIGURATION). With the defaults (Norgespris
+      # with day/night grid tariff):
+      #
+      # Low total charging price:
+      #   weekdays 22:00-06:00
+      #   all weekend
+      #
+      # High total charging price:
+      #   weekdays 06:00-22:00
+      #
+      # Later, for spot pricing, this is the main abstraction
+      # that can be replaced by a price-planning sensor.
+      # ------------------------------------------------------
+
+      - name: "EVLM price allowed"
+        unique_id: evlm_price_allowed
+        state: >
+          {% set cheap_from =
+            state_attr('sensor.evlm_config', 'cheap_from_hour')
+            | int(22)
+          %}
+
+          {% set cheap_until =
+            state_attr('sensor.evlm_config', 'cheap_until_hour')
+            | int(6)
+          %}
+
+          {% set cheap_weekends =
+            state_attr('sensor.evlm_config', 'cheap_weekends')
+            | string | lower != 'false'
+          %}
+
+          {% set h = now().hour %}
+          {% set weekend = now().weekday() >= 5 %}
+
+          {{
+            (weekend and cheap_weekends)
+            or h >= cheap_from
+            or h < cheap_until
+          }}
+        icon: >
+          {% if this.state == 'on' %}
+            mdi:cash-check
+          {% else %}
+            mdi:cash-clock
+          {% endif %}
+
+
+  # ==========================================================
+  # GENERAL MEASUREMENTS
+  # ==========================================================
+
+  - sensor:
+
+      - name: "EVLM garage price status"
+        unique_id: evlm_garage_price_status
+        icon: mdi:information-outline
+        state: >
+          {% if is_state('input_boolean.evlm_price_control', 'off') %}
+
+            Price control disabled - charging allowed
+
+          {% elif is_state('timer.evlm_garage_charge_now', 'active') %}
+
+            CHARGE NOW - cheap-period restriction overridden
+
+          {% elif is_state('binary_sensor.evlm_price_allowed', 'on') %}
+
+            Cheap period - charging allowed
+
+          {% else %}
+
+            Waiting for cheap period - garage paused
+
+          {% endif %}
+
+
+      - name: "EVLM outside price status"
+        unique_id: evlm_outside_price_status
+        icon: mdi:information-outline
+        state: >
+          {% if is_state('input_boolean.evlm_price_control', 'off') %}
+
+            Price control disabled - charging allowed
+
+          {% elif is_state('timer.evlm_outside_charge_now', 'active') %}
+
+            CHARGE NOW - cheap-period restriction overridden
+
+          {% elif is_state('binary_sensor.evlm_price_allowed', 'on') %}
+
+            Cheap period - charging allowed
+
+          {% else %}
+
+            Waiting for cheap period - outside paused
+
+          {% endif %}
+
+
+      - name: "EVLM highest phase current"
+        unique_id: evlm_highest_phase_current
+        unit_of_measurement: A
+        state_class: measurement
+        icon: mdi:current-ac
+        availability: >
+          {{
+            is_state(
+              'binary_sensor.evlm_fuse_measurements_available',
+              'on'
+            )
+          }}
+        state: >
+          {{
+            [
+              states('sensor.evlm_phase_l1_current')
+                | float(0),
+
+              states('sensor.evlm_phase_l2_current')
+                | float(0),
+
+              states('sensor.evlm_phase_l3_current')
+                | float(0)
+            ]
+            | max
+            | round(2)
+          }}
+
+
+      - name: "EVLM limiting phase"
+        unique_id: evlm_limiting_phase
+        icon: mdi:sine-wave
+        availability: >
+          {{
+            is_state(
+              'binary_sensor.evlm_fuse_measurements_available',
+              'on'
+            )
+          }}
+        state: >
+          {% set l1 =
+            states('sensor.evlm_phase_l1_current')
+            | float(0)
+          %}
+
+          {% set l2 =
+            states('sensor.evlm_phase_l2_current')
+            | float(0)
+          %}
+
+          {% set l3 =
+            states('sensor.evlm_phase_l3_current')
+            | float(0)
+          %}
+
+          {% set highest = [l1, l2, l3] | max %}
+
+          {% if highest == l1 %}
+            L1
+          {% elif highest == l2 %}
+            L2
+          {% else %}
+            L3
+          {% endif %}
+
+
+      - name: "EVLM soft fuse limit"
+        unique_id: evlm_soft_fuse_limit
+        unit_of_measurement: A
+        icon: mdi:fuse
+        state: >
+          {% set fuse =
+            states('input_number.evlm_main_fuse') | float(62)
+          %}
+
+          {% set margin =
+            states('input_number.evlm_fuse_margin') | float(3)
+          %}
+
+          {{ (fuse - margin) | round(1) }}
+
+
+      - name: "EVLM fuse headroom"
+        unique_id: evlm_fuse_headroom
+        unit_of_measurement: A
+        state_class: measurement
+        icon: mdi:arrow-expand-vertical
+        availability: >
+          {{
+            is_number(states('sensor.evlm_highest_phase_current'))
+          }}
+        state: >
+          {% set target =
+            states('sensor.evlm_soft_fuse_limit') | float(59)
+          %}
+
+          {% set measured =
+            states('sensor.evlm_highest_phase_current') | float(0)
+          %}
+
+          {{ (target - measured) | round(2) }}
+
+
+      - name: "EVLM energy used this hour"
+        unique_id: evlm_energy_used_this_hour
+        unit_of_measurement: kWh
+        state_class: measurement
+        icon: mdi:meter-electric
+        availability: >
+          {{
+            is_number(
+              states('sensor.evlm_house_energy_current_hour')
+            )
+          }}
+        state: >
+          {{
+            states('sensor.evlm_house_energy_current_hour')
+            | float(0)
+            | round(3)
+          }}
+
+
+      - name: "EVLM energy remaining this hour"
+        unique_id: evlm_energy_remaining_this_hour
+        unit_of_measurement: kWh
+        icon: mdi:battery-clock
+        state: >
+          {% set limit =
+            states('input_number.evlm_hourly_energy_limit')
+            | float(10)
+          %}
+
+          {% set used =
+            states('sensor.evlm_energy_used_this_hour')
+            | float(0)
+          %}
+
+          {{ ([0, limit - used] | max) | round(3) }}
+
+
+      - name: "EVLM minutes remaining this hour"
+        unique_id: evlm_minutes_remaining_this_hour
+        unit_of_measurement: min
+        icon: mdi:clock-outline
+        state: >
+          {{
+            (
+              60
+              - now().minute
+              - (now().second / 60)
+            )
+            | round(1)
+          }}
+
+
+      # ------------------------------------------------------
+      # If consumption continued at the CURRENT whole-house
+      # power until the end of the clock hour, where would we
+      # finish?
+      # ------------------------------------------------------
+
+      - name: "EVLM projected energy this hour"
+        unique_id: evlm_projected_energy_this_hour
+        unit_of_measurement: kWh
+        icon: mdi:chart-line
+        availability: >
+          {{
+            is_state(
+              'binary_sensor.evlm_hourly_measurements_available',
+              'on'
+            )
+          }}
+        state: >
+          {% set used =
+            states('sensor.evlm_energy_used_this_hour')
+            | float(0)
+          %}
+
+          {% set power =
+            states('sensor.evlm_house_power')
+            | float(0)
+          %}
+
+          {% set seconds_left =
+            3600
+            -
+            (
+              now().minute * 60
+              +
+              now().second
+            )
+          %}
+
+          {% set hours_left =
+            [seconds_left / 3600, 0] | max
+          %}
+
+          {{
+            (
+              used
+              +
+              power * hours_left
+            )
+            | round(3)
+          }}
+
+
+      # ------------------------------------------------------
+      # Maximum whole-house power we can average from NOW
+      # until the end of the hour and still land on the limit.
+      # ------------------------------------------------------
+
+      - name: "EVLM allowed house power this hour"
+        unique_id: evlm_allowed_house_power_this_hour
+        unit_of_measurement: kW
+        icon: mdi:speedometer
+        availability: >
+          {{
+            is_number(
+              states('sensor.evlm_energy_remaining_this_hour')
+            )
+          }}
+        state: >
+          {% set remaining =
+            states('sensor.evlm_energy_remaining_this_hour')
+            | float(0)
+          %}
+
+          {% set seconds_left =
+            3600
+            -
+            (
+              now().minute * 60
+              +
+              now().second
+            )
+          %}
+
+          {% set hours_left =
+            [seconds_left / 3600, 0.0002778] | max
+          %}
+
+          {{
+            (remaining / hours_left)
+            | round(3)
+          }}
+
+
+      # ======================================================
+      # PRICE LAYER
+      #
+      # Kept separate from the actual load manager.
+      # This makes it easy to swap in spot-price planning later.
+      # ======================================================
+
+      - name: "EVLM current charging price"
+        unique_id: evlm_current_charging_price
+        unit_of_measurement: NOK/kWh
+        device_class: monetary
+        icon: mdi:cash
+        state: >
+          {% if is_state('binary_sensor.evlm_price_allowed', 'on') %}
+            {{ state_attr('sensor.evlm_config', 'price_cheap') | float(0) }}
+          {% else %}
+            {{ state_attr('sensor.evlm_config', 'price_expensive') | float(0) }}
+          {% endif %}
+
+
+      - name: "EVLM next cheap period"
+        unique_id: evlm_next_cheap_period
+        icon: mdi:calendar-clock
+        state: >
+          {% set cheap_from =
+            state_attr('sensor.evlm_config', 'cheap_from_hour')
+            | int(22)
+          %}
+
+          {% set cheap_until =
+            state_attr('sensor.evlm_config', 'cheap_until_hour')
+            | int(6)
+          %}
+
+          {% set cheap_weekends =
+            state_attr('sensor.evlm_config', 'cheap_weekends')
+            | string | lower != 'false'
+          %}
+
+          {% set h = now().hour %}
+          {% set wd = now().weekday() %}
+
+          {% if wd >= 5 and cheap_weekends %}
+            Cheap now - weekend tariff
+
+          {% elif h < cheap_until %}
+            Cheap now - until {{ '%02d:00' | format(cheap_until) }}
+
+          {% elif h < cheap_from %}
+            Next cheap period starts at {{ '%02d:00' | format(cheap_from) }}
+
+          {% else %}
+            Cheap now - until {{ '%02d:00' | format(cheap_until) }} tomorrow
+
+          {% endif %}
+
+
+      # ------------------------------------------------------
+      # Simple 24-hour forecast.
+      #
+      # This is primarily for the dashboard.
+      #
+      # Later this entire price layer can be replaced by real
+      # spot-price data while the load-control automation stays
+      # the same.
+      # ------------------------------------------------------
+
+      - name: "EVLM price forecast"
+        unique_id: evlm_price_forecast
+        icon: mdi:chart-timeline-variant
+        state: >
+          {{ states('sensor.evlm_current_charging_price') }}
+        attributes:
+
+          next_24_hours: >
+            {% set cheap_from =
+              state_attr('sensor.evlm_config', 'cheap_from_hour')
+              | int(22)
+            %}
+
+            {% set cheap_until =
+              state_attr('sensor.evlm_config', 'cheap_until_hour')
+              | int(6)
+            %}
+
+            {% set cheap_weekends =
+              state_attr('sensor.evlm_config', 'cheap_weekends')
+              | string | lower != 'false'
+            %}
+
+            {% set price_cheap =
+              state_attr('sensor.evlm_config', 'price_cheap')
+              | float(0)
+            %}
+
+            {% set price_expensive =
+              state_attr('sensor.evlm_config', 'price_expensive')
+              | float(0)
+            %}
+
+            {% set ns = namespace(items=[]) %}
+
+            {% for i in range(24) %}
+
+              {% set t = now() + timedelta(hours=i) %}
+
+              {% set low =
+                (t.weekday() >= 5 and cheap_weekends)
+                or t.hour >= cheap_from
+                or t.hour < cheap_until
+              %}
+
+              {% set price =
+                price_cheap if low else price_expensive
+              %}
+
+              {% set ns.items =
+                ns.items
+                +
+                [
+                  t.strftime('%a %H:00')
+                  ~ ' - '
+                  ~ price
+                  ~ ' NOK/kWh'
+                ]
+              %}
+
+            {% endfor %}
+
+            {{ ns.items | join('\n') }}
+
+
+      # ======================================================
+      # FUSE FEEDBACK TARGET
+      #
+      # We do NOT try to identify which physical phase is used
+      # by which charger.
+      #
+      # If the highest measured house phase is above our soft
+      # fuse target, reduce the CURRENT Zaptec installation
+      # setting by approximately the amount we are over.
+      #
+      # Then observe the meter again.
+      # ======================================================
+
+      - name: "EVLM fuse target current"
+        unique_id: evlm_fuse_target_current
+        unit_of_measurement: A
+        icon: mdi:fuse-alert
+        state: >
+          {% set current =
+            states('sensor.evlm_installation_current')
+            | float(0)
+          %}
+
+          {% set minimum =
+            states('input_number.evlm_min_charge_current')
+            | float(6)
+          %}
+
+          {% if is_state('input_boolean.evlm_fuse_guard', 'off') %}
+
+            {{ current | round(0) }}
+
+          {% elif not is_state(
+            'binary_sensor.evlm_fuse_measurements_available',
+            'on'
+          ) %}
+
+            0
+
+          {% else %}
+
+            {% set measured =
+              states('sensor.evlm_highest_phase_current')
+              | float(0)
+            %}
+
+            {% set target =
+              states('sensor.evlm_soft_fuse_limit')
+              | float(59)
+            %}
+
+            {% set over =
+              measured - target
+            %}
+
+            {% if over <= 0 %}
+
+              {{ current | round(0) }}
+
+            {% else %}
+
+              {% set reduction =
+                over
+                | round(0, 'ceil')
+                | int
+              %}
+
+              {% set new =
+                [0, current - reduction]
+                | max
+              %}
+
+              {% if new < minimum %}
+                0
+              {% else %}
+                {{ new | round(0, 'floor') }}
+              {% endif %}
+
+            {% endif %}
+
+          {% endif %}
+
+
+      # ======================================================
+      # CLOCK-HOUR FEEDBACK TARGET
+      # ======================================================
+
+      - name: "EVLM hourly target current"
+        unique_id: evlm_hourly_target_current
+        unit_of_measurement: A
+        icon: mdi:timer-alert-outline
+        state: >
+          {% set current =
+            states('sensor.evlm_installation_current')
+            | float(0)
+          %}
+
+          {% set minimum =
+            states('input_number.evlm_min_charge_current')
+            | float(6)
+          %}
+
+          {% if is_state('input_boolean.evlm_hourly_cap', 'off') %}
+
+            {{ current | round(0) }}
+
+          {% elif not is_state(
+            'binary_sensor.evlm_hourly_measurements_available',
+            'on'
+          ) %}
+
+            0
+
+          {% else %}
+
+            {% set actual_power =
+              states('sensor.evlm_house_power')
+              | float(0)
+            %}
+
+            {% set allowed_power =
+              states(
+                'sensor.evlm_allowed_house_power_this_hour'
+              )
+              | float(0)
+            %}
+
+            {% set excess =
+              actual_power - allowed_power
+            %}
+
+            {% if excess <= 0 %}
+
+              {{ current | round(0) }}
+
+            {% else %}
+
+              {% set kw_per_amp =
+                states('input_number.evlm_kw_per_amp')
+                | float(0.23)
+              %}
+
+              {% set reduction =
+                (excess / kw_per_amp)
+                | round(0, 'ceil')
+                | int
+              %}
+
+              {% set new =
+                [0, current - reduction]
+                | max
+              %}
+
+              {% if new < minimum %}
+                0
+              {% else %}
+                {{ new | round(0, 'floor') }}
+              {% endif %}
+
+            {% endif %}
+
+          {% endif %}
+
+
+      # ======================================================
+      # PRICE TARGET
+      #
+      # Price control is handled independently at each
+      # charger. It must NOT reduce the shared installation
+      # current.
+      # ======================================================
+
+      - name: "EVLM price target current"
+        unique_id: evlm_price_target_current
+        unit_of_measurement: A
+        icon: mdi:cash-clock
+        state: >
+          {{
+            states('sensor.evlm_installation_current')
+            | float(0)
+            | round(0)
+          }}
+
+
+      # ======================================================
+      # REDUCTION TARGET
+      #
+      # This sensor only tells us whether current needs to go
+      # DOWN immediately.
+      #
+      # Increases are handled separately and deliberately slowly.
+      # ======================================================
+
+      - name: "EVLM reduction target"
+        unique_id: evlm_reduction_target
+        unit_of_measurement: A
+        icon: mdi:arrow-down-bold
+        state: >
+          {% set current =
+            states('sensor.evlm_installation_current')
+            | float(0)
+          %}
+
+          {% set fuse =
+            states('sensor.evlm_fuse_target_current')
+            | float(current)
+          %}
+
+          {% set hour =
+            states('sensor.evlm_hourly_target_current')
+            | float(current)
+          %}
+
+          {% set price =
+            states('sensor.evlm_price_target_current')
+            | float(current)
+          %}
+
+          {{
+            [
+              current,
+              fuse,
+              hour,
+              price
+            ]
+            | min
+            | round(0)
+          }}
+
+
+      # ======================================================
+      # CONTROLLER STATUS
+      # ======================================================
+
+      - name: "EVLM status"
+        unique_id: evlm_status
+        icon: mdi:information-outline
+        state: >
+          {% set current =
+            states('sensor.evlm_installation_current')
+            | float(0)
+          %}
+
+          {% set reduction =
+            states('sensor.evlm_reduction_target')
+            | float(current)
+          %}
+
+          {% if is_state(
+            'input_boolean.evlm_automatic_control',
+            'off'
+          ) %}
+
+            Monitoring only - automatic control OFF
+
+          {% elif
+            is_state('input_boolean.evlm_fuse_guard', 'on')
+            and not is_state(
+              'binary_sensor.evlm_fuse_measurements_available',
+              'on'
+            )
+          %}
+
+            Stopped - fuse measurements unavailable
+
+          {% elif
+            is_state('input_boolean.evlm_hourly_cap', 'on')
+            and not is_state(
+              'binary_sensor.evlm_hourly_measurements_available',
+              'on'
+            )
+          %}
+
+            Stopped - energy measurements unavailable
+
+          {% elif
+            states('sensor.evlm_fuse_target_current')
+              | float(current)
+            < current
+          %}
+
+            Reducing - main fuse protection
+
+          {% elif
+            states('sensor.evlm_hourly_target_current')
+              | float(current)
+            < current
+          %}
+
+            Reducing - hourly energy limit
+
+          {% elif reduction < current %}
+
+            Reducing charging current
+
+          {% else %}
+
+            Stable - monitoring available capacity
+
+          {% endif %}
+
+
+# ============================================================
+# MASTER SWITCHES
+# ============================================================
+
+input_boolean:
+
+  evlm_automatic_control:
+    name: EV Load Manager automatic control
+    icon: mdi:robot
+
+  evlm_fuse_guard:
+    name: EVLM main fuse protection
+    icon: mdi:fuse
+
+  evlm_hourly_cap:
+    name: EVLM hourly energy limit
+    icon: mdi:meter-electric
+
+  evlm_price_control:
+    name: EVLM price control
+    icon: mdi:cash-clock
+
+
+# ============================================================
+# USER SETTINGS
+#
+# These are adjusted from the dashboard, not here.
+# ============================================================
+
+input_number:
+
+  evlm_main_fuse:
+    name: EVLM main fuse
+    min: 20
+    max: 100
+    step: 1
+    unit_of_measurement: A
+    icon: mdi:fuse
+
+
+  evlm_fuse_margin:
+    name: EVLM fuse safety margin
+    min: 0
+    max: 15
+    step: 0.5
+    unit_of_measurement: A
+    icon: mdi:shield-outline
+
+
+  evlm_fuse_recovery_buffer:
+    name: EVLM fuse recovery buffer
+    min: 0
+    max: 10
+    step: 0.5
+    unit_of_measurement: A
+    icon: mdi:arrow-collapse-down
+
+
+  evlm_hourly_energy_limit:
+    name: EVLM maximum energy per clock hour
+    min: 1
+    max: 30
+    step: 0.5
+    unit_of_measurement: kWh
+    icon: mdi:counter
+
+
+  evlm_hourly_recovery_buffer:
+    name: EVLM hourly recovery buffer
+    min: 0
+    max: 2
+    step: 0.05
+    unit_of_measurement: kWh
+    icon: mdi:chart-bell-curve-cumulative
+
+
+  evlm_max_current:
+    name: EVLM maximum installation current
+    min: 6
+    max: 32
+    step: 1
+    unit_of_measurement: A
+    icon: mdi:current-ac
+
+
+  evlm_min_charge_current:
+    name: EVLM minimum useful charging current
+    min: 1
+    max: 10
+    step: 1
+    unit_of_measurement: A
+    icon: mdi:current-ac
+
+
+  # This is NOT used to calculate exact charging consumption.
+  #
+  # It is only used to estimate how many amps we should remove
+  # when household power is currently too high for the hourly
+  # energy budget.
+  #
+  # 0.23 kW/A is deliberately conservative for a 230 V system.
+  evlm_kw_per_amp:
+    name: EVLM estimated kW reduction per amp
+    min: 0.10
+    max: 0.70
+    step: 0.01
+    unit_of_measurement: kW/A
+    icon: mdi:flash
+
+
+  evlm_increase_interval:
+    name: EVLM minutes between current increases
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: min
+    icon: mdi:timer-outline
+
+  evlm_increase_step:
+    name: EVLM normal recovery step
+    min: 1
+    max: 10
+    step: 1
+    unit_of_measurement: A
+    icon: mdi:arrow-up-bold
+
+  evlm_garage_max_current:
+    name: EVLM garage charger maximum
+    min: 6
+    max: 32
+    step: 1
+    unit_of_measurement: A
+    icon: mdi:ev-station
+
+  evlm_outside_max_current:
+    name: EVLM outside charger maximum
+    min: 6
+    max: 32
+    step: 1
+    unit_of_measurement: A
+    icon: mdi:ev-station
+
+
+input_text:
+
+  evlm_last_action:
+    name: EVLM last action
+    max: 255
+    initial: No automatic action yet.
+
+
+# ============================================================
+# PER-CHARGER "CHARGE NOW" BUTTONS
+# ============================================================
+
+input_button:
+
+  evlm_garage_charge_now:
+    name: Garage - Charge now
+    icon: mdi:flash
+
+  evlm_outside_charge_now:
+    name: Outside - Charge now
+    icon: mdi:flash
+
+
+# ============================================================
+# 12-HOUR OVERRIDE TIMERS
+# ============================================================
+
+timer:
+
+  evlm_garage_charge_now:
+    name: Garage charge-now override
+    duration: "12:00:00"
+    restore: true
+    icon: mdi:timer
+
+  evlm_outside_charge_now:
+    name: Outside charge-now override
+    duration: "12:00:00"
+    restore: true
+    icon: mdi:timer
+
+
+# ============================================================
+# CLOCK-HOUR ENERGY METER
+#
+# This intentionally uses the cumulative energy sensor rather
+# than a meter's special "current hour" sensor.
+# ============================================================
+
+utility_meter:
+
+  evlm_house_energy_current_hour:
+    source: *meter_energy
+    name: EVLM house energy current hour
+    cycle: hourly
+
+
+# ============================================================
+# AUTOMATION
+#
+# REDUCTIONS:
+#   immediate
+#
+# INCREASES:
+#   one recovery step at a time
+#   after configured cooldown
+#   only if both fuse and hourly budget have recovery margin
+#
+# ============================================================
+
+automation:
+
+  # ==========================================================
+  # CHARGE NOW BUTTONS
+  #
+  # Pressing Charge now starts/restarts a 12-hour override
+  # for that individual charger.
+  # ==========================================================
+
+  - id: evlm_charge_now_buttons
+    alias: "EV Load Manager - Charge now buttons"
+    mode: parallel
+
+    triggers:
+
+      - trigger: state
+        entity_id: input_button.evlm_garage_charge_now
+        id: garage
+
+      - trigger: state
+        entity_id: input_button.evlm_outside_charge_now
+        id: outside
+
+    actions:
+
+      - choose:
+
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'garage' }}"
+
+            sequence:
+
+              - action: timer.start
+                target:
+                  entity_id: timer.evlm_garage_charge_now
+                data:
+                  duration: "12:00:00"
+
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.evlm_last_action
+                data:
+                  value: >
+                    GARAGE CHARGE NOW enabled for 12 hours.
+                    Garage will ignore the cheap-period restriction,
+                    but fuse and hourly-energy protection remain active.
+
+              - action: logbook.log
+                data:
+                  name: EV Load Manager
+                  message: >
+                    GARAGE CHARGE NOW enabled for 12 hours.
+                    Cheap-period restriction overridden for garage only.
+                    Main-fuse and hourly-energy protection remain active.
+
+
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id == 'outside' }}"
+
+            sequence:
+
+              - action: timer.start
+                target:
+                  entity_id: timer.evlm_outside_charge_now
+                data:
+                  duration: "12:00:00"
+
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.evlm_last_action
+                data:
+                  value: >
+                    OUTSIDE CHARGE NOW enabled for 12 hours.
+                    Outside charger will ignore the cheap-period restriction,
+                    but fuse and hourly-energy protection remain active.
+
+              - action: logbook.log
+                data:
+                  name: EV Load Manager
+                  message: >
+                    OUTSIDE CHARGE NOW enabled for 12 hours.
+                    Cheap-period restriction overridden for outside only.
+                    Main-fuse and hourly-energy protection remain active.
+
+
+  # ==========================================================
+  # PER-CHARGER PRICE CONTROL
+  #
+  # This automation ONLY uses individual charger max-current
+  # settings for price scheduling.
+  #
+  # Allowed:
+  #   restore configured charger maximum
+  #
+  # Not allowed:
+  #   set charger max current to 0 A
+  #
+  # The shared installation Available Current remains under
+  # the main EVLM fuse/hour controller.
+  # ==========================================================
+
+  - id: evlm_per_charger_price_control
+    alias: "EV Load Manager - per charger price control"
+    mode: restart
+
+    variables:
+      garage_charger: *garage_max_current
+      outside_charger: *outside_max_current
+
+    triggers:
+
+      - trigger: state
+        entity_id:
+          - binary_sensor.evlm_price_allowed
+          - input_boolean.evlm_price_control
+          - timer.evlm_garage_charge_now
+          - timer.evlm_outside_charge_now
+          - input_number.evlm_garage_max_current
+          - input_number.evlm_outside_max_current
+          - binary_sensor.evlm_garage_charging_allowed_by_price
+          - binary_sensor.evlm_outside_charging_allowed_by_price
+
+      - trigger: homeassistant
+        event: start
+
+    actions:
+
+      # ------------------------------------------------------
+      # Evaluate permission directly from the source entities.
+      # The derived binary sensors may not have updated yet
+      # when this automation runs on the same state change.
+      # ------------------------------------------------------
+
+      - variables:
+
+          price_ok: >
+            {{
+              is_state('input_boolean.evlm_price_control', 'off')
+              or
+              is_state('binary_sensor.evlm_price_allowed', 'on')
+            }}
+
+          garage_allowed: >
+            {{
+              price_ok
+              or
+              is_state('timer.evlm_garage_charge_now', 'active')
+            }}
+
+          outside_allowed: >
+            {{
+              price_ok
+              or
+              is_state('timer.evlm_outside_charge_now', 'active')
+            }}
+
+          garage_target: >
+            {% if garage_allowed %}
+              {{
+                states('input_number.evlm_garage_max_current')
+                | float(32)
+              }}
+            {% else %}
+              0
+            {% endif %}
+
+          outside_target: >
+            {% if outside_allowed %}
+              {{
+                states('input_number.evlm_outside_max_current')
+                | float(32)
+              }}
+            {% else %}
+              0
+            {% endif %}
+
+
+      # ------------------------------------------------------
+      # GARAGE
+      # ------------------------------------------------------
+
+      - if:
+
+          - condition: template
+            value_template: >
+              {{
+                is_number(states(garage_charger))
+                and
+                (
+                  states(garage_charger)
+                  | float(0)
+                  -
+                  garage_target | float(0)
+                ) | abs > 0.1
+              }}
+
+        then:
+
+          - action: number.set_value
+            target:
+              entity_id: *garage_max_current
+            data:
+              value: "{{ garage_target }}"
+
+          - action: logbook.log
+            data:
+              name: EV Load Manager
+              entity_id: *garage_max_current
+              message: >
+                Garage charger max current set to
+                {{ garage_target }} A.
+
+                {{ states('sensor.evlm_garage_price_status') }}
+
+                Charge-now timer:
+                {{ states('timer.evlm_garage_charge_now') }}.
+
+                Cheap-period signal:
+                {{ states('binary_sensor.evlm_price_allowed') }}.
+
+
+      # ------------------------------------------------------
+      # OUTSIDE
+      # ------------------------------------------------------
+
+      - if:
+
+          - condition: template
+            value_template: >
+              {{
+                is_number(states(outside_charger))
+                and
+                (
+                  states(outside_charger)
+                  | float(0)
+                  -
+                  outside_target | float(0)
+                ) | abs > 0.1
+              }}
+
+        then:
+
+          - action: number.set_value
+            target:
+              entity_id: *outside_max_current
+            data:
+              value: "{{ outside_target }}"
+
+          - action: logbook.log
+            data:
+              name: EV Load Manager
+              entity_id: *outside_max_current
+              message: >
+                Outside charger max current set to
+                {{ outside_target }} A.
+
+                {{ states('sensor.evlm_outside_price_status') }}
+
+                Charge-now timer:
+                {{ states('timer.evlm_outside_charge_now') }}.
+
+                Cheap-period signal:
+                {{ states('binary_sensor.evlm_price_allowed') }}.
+
+
+  # ==========================================================
+  # MAIN CONTROLLER
+  #
+  # Adjusts the shared installation Available Current.
+  # ==========================================================
+
+  - id: evlm_controller
+    alias: "EV Load Manager - controller"
+    mode: restart
+
+    variables:
+      installation_current_entity: *installation_current
+
+    triggers:
+
+      # Main fuse measurements
+      - trigger: state
+        entity_id:
+          - sensor.evlm_phase_l1_current
+          - sensor.evlm_phase_l2_current
+          - sensor.evlm_phase_l3_current
+
+
+      # Whole-house consumption
+      - trigger: state
+        entity_id:
+          - sensor.evlm_house_power
+          - sensor.evlm_house_energy_current_hour
+
+
+      # Price window change
+      - trigger: state
+        entity_id:
+          - binary_sensor.evlm_price_allowed
+
+
+      # User settings
+      - trigger: state
+        entity_id:
+          - input_boolean.evlm_automatic_control
+          - input_boolean.evlm_fuse_guard
+          - input_boolean.evlm_hourly_cap
+          - input_boolean.evlm_price_control
+
+          - input_number.evlm_main_fuse
+          - input_number.evlm_fuse_margin
+          - input_number.evlm_fuse_recovery_buffer
+
+          - input_number.evlm_hourly_energy_limit
+          - input_number.evlm_hourly_recovery_buffer
+
+          - input_number.evlm_max_current
+          - input_number.evlm_min_charge_current
+          - input_number.evlm_kw_per_amp
+          - input_number.evlm_increase_interval
+
+      # Fast recovery just after a new clock hour starts.
+      # 10 seconds gives the hourly utility meter time to reset.
+      - trigger: time_pattern
+        minutes: "0"
+        seconds: "10"
+        id: new_clock_hour
+
+      # Recalculate passage of time through current clock hour
+      - trigger: time_pattern
+        minutes: "/1"
+
+
+      - trigger: homeassistant
+        event: start
+
+
+    conditions:
+
+      - condition: state
+        entity_id: input_boolean.evlm_automatic_control
+        state: "on"
+
+
+      - condition: template
+        value_template: >
+          {{ is_number(states(installation_current_entity)) }}
+
+
+    actions:
+
+      - variables:
+
+          increase_step: >
+            {{
+              states('input_number.evlm_increase_step')
+              | float(3)
+            }}
+
+
+          energy_used_this_hour: >
+            {{
+              states('sensor.evlm_energy_used_this_hour')
+              | float(999)
+            }}
+
+
+          current: >
+            {{
+              states(installation_current_entity)
+              | float(0)
+            }}
+
+
+          reduction_target: >
+            {{
+              states('sensor.evlm_reduction_target')
+              | float(0)
+            }}
+
+
+          configured_max: >
+            {{
+              states('input_number.evlm_max_current')
+              | float(32)
+            }}
+
+
+          minimum: >
+            {{
+              states('input_number.evlm_min_charge_current')
+              | float(6)
+            }}
+
+
+          highest_phase: >
+            {{
+              states('sensor.evlm_highest_phase_current')
+              | float(0)
+            }}
+
+
+          soft_fuse_limit: >
+            {{
+              states('sensor.evlm_soft_fuse_limit')
+              | float(59)
+            }}
+
+
+          fuse_recovery: >
+            {{
+              states('input_number.evlm_fuse_recovery_buffer')
+              | float(2)
+            }}
+
+
+          # Must come after the three variables it uses.
+          fuse_headroom_for_increase: >
+            {{
+              (
+                soft_fuse_limit
+                - fuse_recovery
+                - highest_phase
+              )
+              | float(0)
+            }}
+
+
+          projected_hour: >
+            {{
+              states('sensor.evlm_projected_energy_this_hour')
+              | float(0)
+            }}
+
+
+          hour_limit: >
+            {{
+              states('input_number.evlm_hourly_energy_limit')
+              | float(10)
+            }}
+
+
+          hour_recovery: >
+            {{
+              states('input_number.evlm_hourly_recovery_buffer')
+              | float(0.2)
+            }}
+
+
+          seconds_since_current_change: >
+            {{
+              as_timestamp(now())
+              -
+              as_timestamp(
+                states[installation_current_entity].last_changed
+              )
+            }}
+
+
+          increase_wait_seconds: >
+            {{
+              states('input_number.evlm_increase_interval')
+              | float(5)
+              * 60
+            }}
+
+
+          fuse_safe_for_increase: >
+            {{
+              is_state('input_boolean.evlm_fuse_guard', 'off')
+              or
+              (
+                is_state(
+                  'binary_sensor.evlm_fuse_measurements_available',
+                  'on'
+                )
+                and
+                highest_phase
+                  <=
+                (soft_fuse_limit - fuse_recovery)
+              )
+            }}
+
+
+          hour_safe_for_increase: >
+            {{
+              is_state('input_boolean.evlm_hourly_cap', 'off')
+              or
+              (
+                is_state(
+                  'binary_sensor.evlm_hourly_measurements_available',
+                  'on'
+                )
+                and
+                projected_hour
+                  <=
+                (hour_limit - hour_recovery)
+              )
+            }}
+
+
+          # Price is handled independently on each charger.
+          # It does not constrain the shared installation limit.
+          price_safe_for_increase: >
+            true
+
+
+      - choose:
+
+          # ==================================================
+          # FAIL SAFE:
+          # Missing measurements while protection is enabled
+          # ==================================================
+
+          - conditions:
+
+              - condition: template
+                value_template: >
+                  {{
+                    (
+                      is_state(
+                        'input_boolean.evlm_fuse_guard',
+                        'on'
+                      )
+                      and not is_state(
+                        'binary_sensor.evlm_fuse_measurements_available',
+                        'on'
+                      )
+                    )
+                    or
+                    (
+                      is_state(
+                        'input_boolean.evlm_hourly_cap',
+                        'on'
+                      )
+                      and not is_state(
+                        'binary_sensor.evlm_hourly_measurements_available',
+                        'on'
+                      )
+                    )
+                  }}
+
+            sequence:
+
+              - action: number.set_value
+                target:
+                  entity_id: *installation_current
+                data:
+                  value: 0
+
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.evlm_last_action
+                data:
+                  value: >
+                    STOPPED: required household measurements unavailable.
+
+              - action: logbook.log
+                data:
+                  name: EV Load Manager
+                  entity_id: *installation_current
+                  message: >
+                    FAIL-SAFE STOP.
+                    Required measurements were unavailable.
+                    Available current was set to 0 A.
+
+
+          # ==================================================
+          # IMMEDIATE REDUCTION
+          # ==================================================
+
+          - conditions:
+
+              - condition: template
+                value_template: >
+                  {{ reduction_target < current - 0.5 }}
+
+            sequence:
+
+              - variables:
+
+                  safe_target: >
+                    {% if
+                      reduction_target > 0
+                      and reduction_target < minimum
+                    %}
+                      0
+                    {% else %}
+                      {{ reduction_target | int }}
+                    {% endif %}
+
+
+              - action: number.set_value
+                target:
+                  entity_id: *installation_current
+                data:
+                  value: "{{ safe_target }}"
+
+
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.evlm_last_action
+                data:
+                  value: >
+                    Reduced {{ current | round(0) }}
+                    -> {{ safe_target }} A.
+                    {{ states('sensor.evlm_status') }}
+
+
+              - action: logbook.log
+                data:
+                  name: EV Load Manager
+                  entity_id: *installation_current
+                  message: >
+                    REDUCED installation current
+                    from {{ current | round(0) }} A
+                    to {{ safe_target }} A.
+
+                    Highest house phase:
+                    {{ highest_phase | round(1) }} A.
+
+                    Soft fuse target:
+                    {{ soft_fuse_limit | round(1) }} A.
+
+                    Energy used this clock hour:
+                    {{ states('sensor.evlm_energy_used_this_hour') }} kWh.
+
+                    Projected clock-hour energy:
+                    {{ projected_hour | round(2) }} kWh.
+
+                    Clock-hour limit:
+                    {{ hour_limit | round(2) }} kWh.
+
+                    Price control:
+                    {{ states('binary_sensor.evlm_price_allowed') }}.
+
+                    Controller reason:
+                    {{ states('sensor.evlm_status') }}.
+
+
+          # ==================================================
+          # NEW CLOCK HOUR - FAST RECOVERY
+          #
+          # The hourly energy budget has just reset.
+          #
+          # Instead of recovering one step at a time,
+          # immediately use the available fuse headroom.
+          #
+          # We still respect:
+          #   - main fuse protection
+          #   - price control
+          #   - configured maximum
+          #
+          # ==================================================
+
+          - conditions:
+
+              - condition: template
+                value_template: >
+                  {{ trigger.id | default('') == 'new_clock_hour' }}
+
+              - condition: template
+                value_template: >
+                  {{
+                    is_state('input_boolean.evlm_hourly_cap', 'on')
+                    and energy_used_this_hour < 0.5
+                  }}
+
+              - condition: template
+                value_template: >
+                  {{ price_safe_for_increase }}
+
+              - condition: template
+                value_template: >
+                  {{ fuse_safe_for_increase }}
+
+              - condition: template
+                value_template: >
+                  {{ current < configured_max }}
+
+            sequence:
+
+              - variables:
+
+                  fast_target: >
+                    {% if is_state('input_boolean.evlm_fuse_guard', 'off') %}
+
+                      {{ configured_max | int }}
+
+                    {% else %}
+
+                      {% set headroom =
+                        [0, fuse_headroom_for_increase] | max
+                      %}
+
+                      {% set candidate =
+                        [
+                          configured_max,
+                          current + (headroom | round(0, 'floor'))
+                        ] | min
+                      %}
+
+                      {% if candidate < minimum %}
+                        0
+                      {% else %}
+                        {{ candidate | int }}
+                      {% endif %}
+
+                    {% endif %}
+
+
+              - condition: template
+                value_template: >
+                  {{ fast_target | float(0) > current + 0.5 }}
+
+
+              - action: number.set_value
+                target:
+                  entity_id: *installation_current
+                data:
+                  value: "{{ fast_target }}"
+
+
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.evlm_last_action
+                data:
+                  value: >
+                    NEW HOUR: fast recovery
+                    {{ current | round(0) }}
+                    -> {{ fast_target }} A.
+                    Hourly energy budget reset.
+                    Fuse headroom allows rapid increase.
+
+
+              - action: logbook.log
+                data:
+                  name: EV Load Manager
+                  entity_id: *installation_current
+                  message: >
+                    NEW CLOCK HOUR - FAST RECOVERY.
+
+                    Hourly meter has reset to
+                    {{ energy_used_this_hour | round(2) }} kWh.
+
+                    Previous Zaptec limit:
+                    {{ current | round(0) }} A.
+
+                    New Zaptec limit:
+                    {{ fast_target }} A.
+
+                    Highest measured house phase:
+                    {{ highest_phase | round(1) }} A.
+
+                    Soft fuse limit:
+                    {{ soft_fuse_limit | round(1) }} A.
+
+                    Fuse recovery buffer:
+                    {{ fuse_recovery | round(1) }} A.
+
+                    Available fuse headroom used for recovery:
+                    {{ fuse_headroom_for_increase | round(1) }} A.
+
+                    Price currently permits charging:
+                    {{ price_safe_for_increase }}.
+
+
+          # ==================================================
+          # SLOW INCREASE
+          #
+          # Only one recovery step at a time.
+          #
+          # If currently paused at 0 A, restart at the minimum
+          # useful charging current rather than 1 A.
+          # ==================================================
+
+          - conditions:
+
+              - condition: template
+                value_template: >
+                  {{
+                    fuse_safe_for_increase
+                    and
+                    hour_safe_for_increase
+                    and
+                    price_safe_for_increase
+                    and
+                    current < configured_max
+                    and
+                    seconds_since_current_change
+                      >=
+                    increase_wait_seconds
+                  }}
+
+            sequence:
+
+              - variables:
+
+                  increased_target: >
+                    {% if current < minimum %}
+
+                      {{ minimum | int }}
+
+                    {% else %}
+
+                      {{
+                        [
+                          configured_max,
+                          current + increase_step
+                        ]
+                        | min
+                        | int
+                      }}
+
+                    {% endif %}
+
+
+              - action: number.set_value
+                target:
+                  entity_id: *installation_current
+                data:
+                  value: "{{ increased_target }}"
+
+
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.evlm_last_action
+                data:
+                  value: >
+                    Increased {{ current | round(0) }}
+                    -> {{ increased_target }} A.
+                    Fuse and hourly budget have spare capacity.
+
+
+              - action: logbook.log
+                data:
+                  name: EV Load Manager
+                  entity_id: *installation_current
+                  message: >
+                    INCREASED installation current
+                    from {{ current | round(0) }} A
+                    to {{ increased_target }} A.
+
+                    Increase is deliberately gradual.
+
+                    Highest house phase:
+                    {{ highest_phase | round(1) }} A.
+
+                    Soft fuse target:
+                    {{ soft_fuse_limit | round(1) }} A.
+
+                    Fuse recovery threshold:
+                    {{
+                      (soft_fuse_limit - fuse_recovery)
+                      | round(1)
+                    }} A.
+
+                    Projected clock-hour energy:
+                    {{ projected_hour | round(2) }} kWh.
+
+                    Increase threshold:
+                    {{
+                      (hour_limit - hour_recovery)
+                      | round(2)
+                    }} kWh.
+
+                    Price currently permits charging:
+                    {{ price_safe_for_increase }}.

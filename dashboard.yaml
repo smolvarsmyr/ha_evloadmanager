@@ -1,0 +1,444 @@
+# ============================================================
+# EV LOAD MANAGER - DASHBOARD
+#
+# Paste into a dashboard's raw configuration editor:
+#   Settings -> Dashboards -> (open dashboard) -> pencil ->
+#   three dots -> Raw configuration editor
+#
+# EDIT THE ENTITY IDS BELOW. Like the package, each one is
+# written once here as a YAML anchor ("&name") and reused
+# further down as "*name". Only change the text after the
+# anchor.
+#
+# Meter readings (phase currents, house power) come from the
+# package's own EVLM sensors, so they are not repeated here.
+# ============================================================
+
+evlm_entities:
+
+  # Zaptec installation "Available current"
+  installation_current: &installation_current number.your_installation_available_current
+
+  # Garage charger
+  garage_max_current: &garage_max_current number.your_garage_charger_charger_max_current
+  garage_charge_power: &garage_charge_power sensor.your_garage_charger_charge_power
+  garage_charger_mode: &garage_charger_mode sensor.your_garage_charger_charger_mode
+  garage_allocated_current: &garage_allocated_current sensor.your_garage_charger_allocated_charge_current
+
+  # Outside charger
+  outside_max_current: &outside_max_current number.your_outside_charger_charger_max_current
+  outside_charge_power: &outside_charge_power sensor.your_outside_charger_charge_power
+  outside_charger_mode: &outside_charger_mode sensor.your_outside_charger_charger_mode
+  outside_allocated_current: &outside_allocated_current sensor.your_outside_charger_allocated_charge_current
+
+
+views:
+  - type: sections
+    max_columns: 4
+    title: EV Load Manager
+    path: ev-load-manager
+    icon: mdi:ev-station
+    sections:
+      - type: grid
+        cards:
+          - type: tile
+            entity: *garage_charge_power
+          - type: tile
+            entity: *outside_charge_power
+          - type: tile
+            entity: *garage_charger_mode
+          - type: tile
+            entity: *outside_charger_mode
+        column_span: 4
+      - type: grid
+        cards:
+          - type: heading
+            heading: EV Load Manager
+            heading_style: title
+            icon: mdi:ev-station
+          - type: tile
+            entity: input_boolean.evlm_automatic_control
+            name: Automatic control
+            features:
+              - type: toggle
+            grid_options:
+              columns: 6
+              rows: 2
+          - type: tile
+            entity: *installation_current
+            name: Zaptec available current
+            grid_options:
+              columns: 6
+              rows: 2
+          - type: tile
+            entity: sensor.evlm_status
+            name: Controller status
+            grid_options:
+              columns: 12
+              rows: 2
+          - type: tile
+            entity: sensor.evlm_configuration_check
+            name: Configuration check
+            grid_options:
+              columns: 12
+              rows: 1
+          - type: markdown
+            content: >
+              ## {{ states('sensor.evlm_status') }}
+
+              **Zaptec installation setting:**   {{
+              states('sensor.evlm_installation_current') }} A
+
+              **Last automatic action:**   {{
+              states('input_text.evlm_last_action') }}
+
+              ---
+
+              ### Main fuse
+
+              L1: {{ states('sensor.evlm_phase_l1_current') }} A
+
+              L2: {{ states('sensor.evlm_phase_l2_current') }} A
+
+              L3: {{ states('sensor.evlm_phase_l3_current') }} A
+
+              Highest: **{{ states('sensor.evlm_highest_phase_current') }} A ({{
+              states('sensor.evlm_limiting_phase') }})**
+
+              EVLM target: {{ states('sensor.evlm_soft_fuse_limit') }} A
+
+              Current headroom: **{{ states('sensor.evlm_fuse_headroom') }} A**
+
+              ---
+
+              ### Clock-hour energy
+
+              Used: **{{ states('sensor.evlm_energy_used_this_hour') }} / {{
+              states('input_number.evlm_hourly_energy_limit') }} kWh**
+
+              Remaining: {{ states('sensor.evlm_energy_remaining_this_hour') }}
+              kWh
+
+              Time remaining: {{
+              states('sensor.evlm_minutes_remaining_this_hour') }} min
+
+              Current house power: {{ states('sensor.evlm_house_power') }} kW
+
+              At the present load, projected end-of-hour use is:
+
+              **{{ states('sensor.evlm_projected_energy_this_hour') }} kWh**
+
+              To finish on the configured limit, average household power for the
+              rest of this hour should not exceed:
+
+              **{{ states('sensor.evlm_allowed_house_power_this_hour') }} kW**
+
+              ---
+
+              ### Price control
+
+              Current charging price: **{{
+              states('sensor.evlm_current_charging_price') }} NOK/kWh**
+
+              {{ states('sensor.evlm_next_cheap_period') }}
+      - type: grid
+        cards:
+          - type: heading
+            heading: Controller decisions
+            heading_style: title
+            icon: mdi:brain
+          - type: tile
+            entity: sensor.evlm_fuse_target_current
+            name: Fuse target now
+          - type: tile
+            entity: sensor.evlm_hourly_target_current
+            name: Hourly-energy target now
+          - type: tile
+            entity: sensor.evlm_price_target_current
+            name: Price target now
+          - type: tile
+            entity: sensor.evlm_reduction_target
+            name: Immediate reduction target
+          - type: markdown
+            content: >
+              ### How EV Load Manager decides
+
+              EVLM does **not** assume anything about how Zaptec's phase labels
+              correspond to the house phases.
+
+              It watches the actual supply currents measured by the main meter.
+
+              **Fuse feedback:**   {{
+              states('sensor.evlm_highest_phase_current') }} A measured, target
+              {{ states('sensor.evlm_soft_fuse_limit') }} A.
+
+              **Hourly feedback:**   {{
+              states('sensor.evlm_projected_energy_this_hour') }} kWh projected,
+              target {{ states('input_number.evlm_hourly_energy_limit') }} kWh.
+
+              **Price:**   {% if is_state('binary_sensor.evlm_price_allowed',
+              'on') %} Charging is currently allowed by the price schedule. {%
+              else %} Charging is currently blocked by the price schedule. {%
+              endif %}
+
+              Reductions happen immediately.
+
+              Increases happen only **{{
+              states('input_number.evlm_increase_step') | int(0) }} A at a
+              time**, with {{ states('input_number.evlm_increase_interval') }}
+              minutes between increases.
+      - type: grid
+        cards:
+          - type: heading
+            heading: Main fuse protection
+            heading_style: title
+            icon: mdi:fuse
+          - type: tile
+            entity: input_boolean.evlm_fuse_guard
+            name: Fuse protection
+            features:
+              - type: toggle
+          - type: tile
+            entity: binary_sensor.evlm_fuse_measurements_available
+            name: Measurements available
+          - type: tile
+            entity: input_number.evlm_main_fuse
+            name: Main fuse
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.evlm_fuse_margin
+            name: Safety margin
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.evlm_fuse_recovery_buffer
+            name: Recovery buffer
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: sensor.evlm_highest_phase_current
+            name: Highest phase
+          - type: tile
+            entity: sensor.evlm_limiting_phase
+            name: Highest phase is
+          - type: tile
+            entity: sensor.evlm_fuse_headroom
+            name: Headroom
+          - type: statistics-graph
+            title: Main supply currents
+            entities:
+              - entity: sensor.evlm_phase_l1_current
+                name: L1
+              - entity: sensor.evlm_phase_l2_current
+                name: L2
+              - entity: sensor.evlm_phase_l3_current
+                name: L3
+            days_to_show: 1
+            period: 5minute
+            chart_type: line
+            stat_types:
+              - mean
+      - type: grid
+        cards:
+          - type: heading
+            heading: Clock-hour energy limit
+            heading_style: title
+            icon: mdi:meter-electric
+          - type: tile
+            entity: input_boolean.evlm_hourly_cap
+            name: Hourly limit
+            features:
+              - type: toggle
+          - type: tile
+            entity: binary_sensor.evlm_hourly_measurements_available
+            name: Measurements available
+          - type: tile
+            entity: input_number.evlm_hourly_energy_limit
+            name: Maximum per clock hour
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: sensor.evlm_energy_used_this_hour
+            name: Used this hour
+          - type: tile
+            entity: sensor.evlm_energy_remaining_this_hour
+            name: Remaining budget
+          - type: tile
+            entity: sensor.evlm_projected_energy_this_hour
+            name: Projected total
+          - type: tile
+            entity: sensor.evlm_allowed_house_power_this_hour
+            name: Allowed average power
+          - type: tile
+            entity: input_number.evlm_hourly_recovery_buffer
+            name: Recovery buffer
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.evlm_kw_per_amp
+            name: Estimated kW/A
+            features:
+              - type: numeric-input
+          - type: statistics-graph
+            title: Household consumption per clock hour
+            entities:
+              - entity: sensor.evlm_house_energy_current_hour
+                name: Whole house
+            days_to_show: 3
+            period: hour
+            chart_type: bar
+            stat_types:
+              - change
+      - type: grid
+        cards:
+          - type: heading
+            heading: Charger scheduling
+            heading_style: title
+            icon: mdi:calendar-clock
+          - type: button
+            entity: input_button.evlm_garage_charge_now
+            name: Charge now - Garage
+            icon: mdi:flash
+            show_state: false
+          - type: tile
+            entity: timer.evlm_garage_charge_now
+            name: Garage override
+          - type: tile
+            entity: sensor.evlm_garage_price_status
+            name: Garage
+          - type: tile
+            entity: input_number.evlm_garage_max_current
+            name: Garage maximum
+            features:
+              - type: numeric-input
+          - type: button
+            entity: input_button.evlm_outside_charge_now
+            name: Charge now - Outside
+            icon: mdi:flash
+            show_state: false
+          - type: tile
+            entity: timer.evlm_outside_charge_now
+            name: Outside override
+          - type: tile
+            entity: sensor.evlm_outside_price_status
+            name: Outside
+          - type: tile
+            entity: input_number.evlm_outside_max_current
+            name: Outside maximum
+            features:
+              - type: numeric-input
+          - type: markdown
+            content: >
+              ### Charging schedule
+
+              **Garage:**   {{ states('sensor.evlm_garage_price_status') }}
+
+              **Outside:**   {{ states('sensor.evlm_outside_price_status') }}
+
+              ---
+
+              **Cheap-period schedule:**   {{
+              states('sensor.evlm_next_cheap_period') }}
+
+              **Installation load limit:**   {{
+              states('sensor.evlm_installation_current') }} A
+
+              The Charge now buttons override **price scheduling only**.
+
+              Main-fuse protection and the clock-hour energy limit remain
+              active.
+      - type: grid
+        cards:
+          - type: heading
+            heading: Price control
+            heading_style: title
+            icon: mdi:cash-clock
+          - type: tile
+            entity: input_boolean.evlm_price_control
+            name: Charge in cheap periods only
+            features:
+              - type: toggle
+          - type: tile
+            entity: binary_sensor.evlm_price_allowed
+            name: Charging allowed now
+          - type: tile
+            entity: sensor.evlm_current_charging_price
+            name: Current total price
+          - type: tile
+            entity: sensor.evlm_next_cheap_period
+            name: Next price window
+          - type: markdown
+            content: |
+              {% set cfg = 'sensor.evlm_config' %}
+              {% set from_h = '%02d:00' | format(state_attr(cfg, 'cheap_from_hour') | int(22)) %}
+              {% set until_h = '%02d:00' | format(state_attr(cfg, 'cheap_until_hour') | int(6)) %}
+              {% set weekends = state_attr(cfg, 'cheap_weekends') | string | lower != 'false' %}
+              ### Price schedule
+
+              **Now:** {{ states('sensor.evlm_current_charging_price') }} NOK/kWh
+
+              **{{ states('sensor.evlm_next_cheap_period') }}**
+
+              Current setup:
+
+              * Weekdays {{ until_h }}–{{ from_h }}: **{{ state_attr(cfg, 'price_expensive') }} NOK/kWh**
+              * Weekdays {{ from_h }}–{{ until_h }}: **{{ state_attr(cfg, 'price_cheap') }} NOK/kWh**
+              * Weekend: **{{ state_attr(cfg, 'price_cheap' if weekends else 'price_expensive') }} NOK/kWh**{{ ' (all day)' if weekends else ' (same as weekdays)' }}
+
+              This price layer is deliberately separated from the load
+              controller. Later it can be replaced by actual future spot prices
+              without rewriting the fuse or hourly-energy logic.
+      - type: grid
+        cards:
+          - type: heading
+            heading: Controller settings
+            heading_style: title
+            icon: mdi:tune
+          - type: tile
+            entity: *outside_max_current
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: *garage_max_current
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.evlm_max_current
+            name: Maximum Zaptec current
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.evlm_min_charge_current
+            name: Minimum useful current
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.evlm_increase_interval
+            name: Minutes between increases
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.evlm_increase_step
+            name: Recovery step
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: *installation_current
+            name: Actual installation setting
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: *garage_allocated_current
+            name: Garage allocated
+          - type: tile
+            entity: *outside_allocated_current
+            name: Outside allocated
+          - type: history-graph
+            title: EV Load Manager result
+            hours_to_show: 24
+            entities:
+              - entity: *installation_current
+                name: Installation limit
+              - entity: sensor.evlm_highest_phase_current
+                name: Highest house phase
