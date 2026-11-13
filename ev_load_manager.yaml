@@ -1607,7 +1607,14 @@ automation:
 
   - id: evlm_controller
     alias: "EV Load Manager - controller"
-    mode: restart
+
+    # NOT "restart": the meter updates every few seconds, and
+    # each update would cancel a Zaptec cloud call that is
+    # still in flight, so the new limit never got applied.
+    # Triggers that arrive during a run are dropped; the next
+    # meter update re-evaluates with fresh values.
+    mode: single
+    max_exceeded: silent
 
     variables:
       installation_current_entity: *installation_current
@@ -1686,6 +1693,14 @@ automation:
     actions:
 
       - variables:
+
+          # Max seconds to wait for Zaptec to report a new value
+          confirm_timeout: 30
+
+          # Seconds to let the chargers ramp down after a
+          # reduction before measuring again. Without this the
+          # same overshoot is subtracted twice.
+          reduction_settle: 20
 
           increase_step: >
             {{
@@ -1884,12 +1899,19 @@ automation:
                 data:
                   value: 0
 
+              - wait_template: >
+                  {{ states(installation_current_entity) | float(-1) == 0 }}
+                timeout: "{{ confirm_timeout }}"
+                continue_on_timeout: true
+
               - action: input_text.set_value
                 target:
                   entity_id: input_text.evlm_last_action
                 data:
                   value: >
                     STOPPED: required household measurements unavailable.
+                    {{ '' if wait.completed else
+                       'WARNING: Zaptec has not confirmed 0 A.' }}
 
               - action: logbook.log
                 data:
@@ -1933,6 +1955,21 @@ automation:
                   value: "{{ safe_target }}"
 
 
+              - wait_template: >
+                  {{
+                    (
+                      states(installation_current_entity) | float(-1)
+                      - safe_target | float(0)
+                    ) | abs < 0.5
+                  }}
+                timeout: "{{ confirm_timeout }}"
+                continue_on_timeout: true
+
+
+              - variables:
+                  confirmed: "{{ wait.completed }}"
+
+
               - action: input_text.set_value
                 target:
                   entity_id: input_text.evlm_last_action
@@ -1941,6 +1978,8 @@ automation:
                     Reduced {{ current | round(0) }}
                     -> {{ safe_target }} A.
                     {{ states('sensor.evlm_status') }}
+                    {{ '' if confirmed else
+                       'WARNING: Zaptec has not confirmed the new value.' }}
 
 
               - action: logbook.log
@@ -1972,6 +2011,13 @@ automation:
 
                     Controller reason:
                     {{ states('sensor.evlm_status') }}.
+
+                    Confirmed by Zaptec:
+                    {{ confirmed }}.
+
+
+              - delay:
+                  seconds: "{{ reduction_settle }}"
 
 
           # ==================================================
@@ -2057,6 +2103,17 @@ automation:
                   value: "{{ fast_target }}"
 
 
+              - wait_template: >
+                  {{
+                    (
+                      states(installation_current_entity) | float(-1)
+                      - fast_target | float(0)
+                    ) | abs < 0.5
+                  }}
+                timeout: "{{ confirm_timeout }}"
+                continue_on_timeout: true
+
+
               - action: input_text.set_value
                 target:
                   entity_id: input_text.evlm_last_action
@@ -2067,6 +2124,8 @@ automation:
                     -> {{ fast_target }} A.
                     Hourly energy budget reset.
                     Fuse headroom allows rapid increase.
+                    {{ '' if wait.completed else
+                       'WARNING: Zaptec has not confirmed the new value.' }}
 
 
               - action: logbook.log
@@ -2158,6 +2217,17 @@ automation:
                   value: "{{ increased_target }}"
 
 
+              - wait_template: >
+                  {{
+                    (
+                      states(installation_current_entity) | float(-1)
+                      - increased_target | float(0)
+                    ) | abs < 0.5
+                  }}
+                timeout: "{{ confirm_timeout }}"
+                continue_on_timeout: true
+
+
               - action: input_text.set_value
                 target:
                   entity_id: input_text.evlm_last_action
@@ -2166,6 +2236,8 @@ automation:
                     Increased {{ current | round(0) }}
                     -> {{ increased_target }} A.
                     Fuse and hourly budget have spare capacity.
+                    {{ '' if wait.completed else
+                       'WARNING: Zaptec has not confirmed the new value.' }}
 
 
               - action: logbook.log

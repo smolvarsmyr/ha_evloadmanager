@@ -28,7 +28,9 @@ integration for EVLM itself.
 - **Feedback, not modelling.** EVLM doesn't try to work out which Zaptec phase
   maps to which house phase. It changes the installation current, watches the
   meter, and corrects again.
-- **Fast down, slow up.** Reductions happen right away. Increases happen one
+- **Fast down, slow up.** Reductions happen right away. After each one EVLM
+  waits for Zaptec to confirm the new value, then gives the chargers 20 s to
+  ramp down before it measures again. Increases happen one
   *recovery step* at a time, with a cooldown between steps, and only when both
   the fuse and the hourly budget have spare margin. The exception is the start
   of a new clock hour: the budget resets, so EVLM jumps straight up to whatever
